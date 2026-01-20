@@ -3,8 +3,9 @@
 
 import sqlite3
 import sys
+import os
 
-DB_NAME = "myapp.db"
+DB_NAME = os.path.abspath(os.getenv("SQLITE_DB", "myapp.db"))
 
 def print_help():
     """Print help information"""

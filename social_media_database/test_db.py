@@ -5,7 +5,7 @@ import sqlite3
 import sys
 import os
 
-DB_NAME = "myapp.db"
+DB_NAME = os.path.abspath(os.getenv("SQLITE_DB", "myapp.db"))
 
 try:
     # Check if database file exists

@@ -1,132 +1,187 @@
 #!/usr/bin/env python3
-"""Initialize SQLite database for social_media_database"""
+"""Initialize and migrate SQLite database for social_media_database
 
-import sqlite3
+This script:
+- Creates database if it doesn't exist
+- Applies migrations in order from migrations/ directory
+- Seeds development data using seeds/ scripts when requested
+- Writes connection info and visualizer env
+
+Environment:
+- SQLITE_DB: Optional path to sqlite file. Defaults to ./myapp.db
+
+Usage:
+- python init_db.py                # initialize/migrate only
+- python init_db.py --seed         # also seed dev data
+- python init_db.py --reset        # delete db and re-init (dangerous)
+"""
+
+import argparse
 import os
+import sqlite3
+import sys
+from pathlib import Path
+from datetime import datetime
 
-DB_NAME = "myapp.db"
-DB_USER = "kaviasqlite"  # Not used for SQLite, but kept for consistency
-DB_PASSWORD = "kaviadefaultpassword"  # Not used for SQLite, but kept for consistency
-DB_PORT = "5000"  # Not used for SQLite, but kept for consistency
+DEFAULT_DB = "myapp.db"
 
-print("Starting SQLite setup...")
 
-# Check if database already exists
-db_exists = os.path.exists(DB_NAME)
-if db_exists:
-    print(f"SQLite database already exists at {DB_NAME}")
-    # Verify it's accessible
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        conn.execute("SELECT 1")
-        conn.close()
-        print("Database is accessible and working.")
-    except Exception as e:
-        print(f"Warning: Database exists but may be corrupted: {e}")
-else:
-    print("Creating new SQLite database...")
+def get_db_path() -> str:
+    """Resolve database file path using env SQLITE_DB or default."""
+    db_path = os.getenv("SQLITE_DB", DEFAULT_DB)
+    return os.path.abspath(db_path)
 
-# Create database with sample tables
-conn = sqlite3.connect(DB_NAME)
-cursor = conn.cursor()
 
-# Create initial schema
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS app_info (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        key TEXT UNIQUE NOT NULL,
-        value TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+def ensure_dirs():
+    """Ensure support directories exist."""
+    for d in ["migrations", "seeds", "helpers", "db_visualizer"]:
+        Path(d).mkdir(parents=True, exist_ok=True)
+
+
+def connect(db_path: str) -> sqlite3.Connection:
+    """Create sqlite connection with foreign keys enabled."""
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def init_migrations_table(conn: sqlite3.Connection):
+    """Create migrations table if not exists."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT UNIQUE NOT NULL,
+            applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
     )
-""")
+    conn.commit()
 
-# Create a sample users table as an example
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        email TEXT UNIQUE NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-""")
 
-# Insert initial data
-cursor.execute("INSERT OR REPLACE INTO app_info (key, value) VALUES (?, ?)", 
-               ("project_name", "social_media_database"))
-cursor.execute("INSERT OR REPLACE INTO app_info (key, value) VALUES (?, ?)", 
-               ("version", "0.1.0"))
-cursor.execute("INSERT OR REPLACE INTO app_info (key, value) VALUES (?, ?)", 
-               ("author", "John Doe"))
-cursor.execute("INSERT OR REPLACE INTO app_info (key, value) VALUES (?, ?)", 
-               ("description", ""))
+def get_applied_migrations(conn: sqlite3.Connection) -> set[str]:
+    """Return set of applied migration filenames."""
+    cur = conn.cursor()
+    cur.execute("SELECT filename FROM schema_migrations")
+    rows = cur.fetchall()
+    return {r[0] for r in rows}
 
-conn.commit()
 
-# Get database statistics
-cursor.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-table_count = cursor.fetchone()[0]
+def run_migrations(conn: sqlite3.Connection, migrations_dir: Path) -> list[str]:
+    """Execute pending migrations one by one in filename order."""
+    init_migrations_table(conn)
+    applied = get_applied_migrations(conn)
+    executed: list[str] = []
 
-cursor.execute("SELECT COUNT(*) FROM app_info")
-record_count = cursor.fetchone()[0]
+    files = sorted([f for f in migrations_dir.glob("*.py") if f.name[0:3].isdigit()])
+    for f in files:
+        if f.name in applied:
+            continue
+        # Execute migration script in isolated namespace
+        namespace = {}
+        with open(f, "r", encoding="utf-8") as fh:
+            code = fh.read()
+        try:
+            exec(compile(code, str(f), "exec"), namespace)  # noqa: S102 - controlled execution for migration scripts
+            if "upgrade" not in namespace or not callable(namespace["upgrade"]):
+                raise RuntimeError(f"Migration {f.name} missing upgrade(conn) function")
+            namespace["upgrade"](conn)
+            conn.execute("INSERT INTO schema_migrations (filename, applied_at) VALUES (?, ?)", (f.name, datetime.utcnow().isoformat()))
+            conn.commit()
+            executed.append(f.name)
+            print(f"✓ Applied migration {f.name}")
+        except Exception as e:
+            conn.rollback()
+            print(f"✗ Migration failed {f.name}: {e}")
+            raise
+    return executed
 
-conn.close()
 
-# Save connection information to a file
-current_dir = os.getcwd()
-connection_string = f"sqlite:///{current_dir}/{DB_NAME}"
-
-try:
-    with open("db_connection.txt", "w") as f:
-        f.write(f"# SQLite connection methods:\n")
-        f.write(f"# Python: sqlite3.connect('{DB_NAME}')\n")
+def write_connection_info(db_path: str):
+    """Write connection helper files."""
+    cwd = os.getcwd()
+    connection_string = f"sqlite:///{db_path}"
+    with open("db_connection.txt", "w", encoding="utf-8") as f:
+        f.write("# SQLite connection methods:\n")
+        f.write(f"# Python: sqlite3.connect('{db_path}')\n")
         f.write(f"# Connection string: {connection_string}\n")
-        f.write(f"# File path: {current_dir}/{DB_NAME}\n")
-    print("Connection information saved to db_connection.txt")
-except Exception as e:
-    print(f"Warning: Could not save connection info: {e}")
+        f.write(f"# File path: {db_path}\n")
 
-# Create environment variables file for Node.js viewer
-db_path = os.path.abspath(DB_NAME)
+    # Visualizer env
+    with open("db_visualizer/sqlite.env", "w", encoding="utf-8") as f:
+        f.write(f'export SQLITE_DB="{db_path}"\n')
 
-# Ensure db_visualizer directory exists
-if not os.path.exists("db_visualizer"):
-    os.makedirs("db_visualizer", exist_ok=True)
-    print("Created db_visualizer directory")
 
-try:
-    with open("db_visualizer/sqlite.env", "w") as f:
-        f.write(f"export SQLITE_DB=\"{db_path}\"\n")
-    print(f"Environment variables saved to db_visualizer/sqlite.env")
-except Exception as e:
-    print(f"Warning: Could not save environment variables: {e}")
+def seed_data(conn: sqlite3.Connection, seeds_dir: Path):
+    """Run seed scripts (ordered by filename). Idempotent inserts are recommended in seed files."""
+    files = sorted(seeds_dir.glob("*.py"))
+    for f in files:
+        namespace = {}
+        with open(f, "r", encoding="utf-8") as fh:
+            code = fh.read()
+        try:
+            exec(compile(code, str(f), "exec"), namespace)  # noqa: S102
+            if "run" not in namespace or not callable(namespace["run"]):
+                print(f"- Skipping seed {f.name}: missing run(conn)")
+                continue
+            namespace["run"](conn)
+            conn.commit()
+            print(f"✓ Seeded {f.name}")
+        except Exception as e:
+            conn.rollback()
+            print(f"✗ Seed failed {f.name}: {e}")
+            raise
 
-print("\nSQLite setup complete!")
-print(f"Database: {DB_NAME}")
-print(f"Location: {current_dir}/{DB_NAME}")
-print("")
 
-print("To use with Node.js viewer, run: source db_visualizer/sqlite.env")
+def reset_db(db_path: str):
+    """Delete database file if exists."""
+    if os.path.exists(db_path):
+        os.remove(db_path)
+        print(f"Deleted database {db_path}")
 
-print("\nTo connect to the database, use one of the following methods:")
-print(f"1. Python: sqlite3.connect('{DB_NAME}')")
-print(f"2. Connection string: {connection_string}")
-print(f"3. Direct file access: {current_dir}/{DB_NAME}")
-print("")
 
-print("Database statistics:")
-print(f"  Tables: {table_count}")
-print(f"  App info records: {record_count}")
+def parse_args():
+    parser = argparse.ArgumentParser(description="Initialize and migrate SQLite database")
+    parser.add_argument("--seed", action="store_true", help="Run seed scripts after migrations")
+    parser.add_argument("--reset", action="store_true", help="Delete existing DB and re-initialize")
+    return parser.parse_args()
 
-# If sqlite3 CLI is available, show how to use it
-try:
-    import subprocess
-    result = subprocess.run(['which', 'sqlite3'], capture_output=True, text=True)
-    if result.returncode == 0:
-        print("")
-        print("SQLite CLI is available. You can also use:")
-        print(f"  sqlite3 {DB_NAME}")
-except:
-    pass
 
-# Exit successfully
-print("\nScript completed successfully.")
+def main():
+    print("Starting SQLite initialization...")
+    args = parse_args()
+    ensure_dirs()
+    db_path = get_db_path()
+
+    if args.reset:
+        reset_db(db_path)
+
+    # Touch DB if not exists
+    db_exists = os.path.exists(db_path)
+    if not db_exists:
+        Path(db_path).touch()
+        print(f"Created new SQLite database at {db_path}")
+    else:
+        print(f"Using existing database at {db_path}")
+
+    conn = connect(db_path)
+
+    # Apply migrations
+    executed = run_migrations(conn, Path("migrations"))
+    print(f"Migrations applied: {len(executed)}")
+
+    # Optionally seed
+    if args.seed:
+        seed_data(conn, Path("seeds"))
+
+    conn.close()
+    write_connection_info(db_path)
+
+    print("\nInitialization complete.")
+    print(f"- Database: {db_path}")
+    print("- To view in visualizer: source db_visualizer/sqlite.env && (cd db_visualizer && npm start)")
+    print("- Use ./db_shell.py for interactive SQL")
+
+
+if __name__ == "__main__":
+    main()
